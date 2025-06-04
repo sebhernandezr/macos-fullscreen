@@ -1,140 +1,56 @@
-use objc2::{rc::Retained, MainThreadMarker};
-use objc2_app_kit::{NSApp, NSApplicationPresentationOptions, NSScreen, NSView, NSWindow};
+use objc2::rc::Retained;
+use objc2::{MainThreadMarker, Message};
+use objc2_app_kit::{
+    NSApp, NSApplicationPresentationOptions, NSScreen, NSView, NSWindow, NSWindowOrderingMode,
+};
 use objc2_foundation::NSRect;
 use std::sync::Mutex;
-use tauri::{Manager, State};
+use tauri::{AppHandle, Manager, State};
 
+#[derive(Debug, Default)]
 pub struct Fullscreen {
-    ns_window_ptr: *mut NSWindow,
-    ns_view_ptr: *mut NSView,
-    standard_frame: Option<NSRect>,
+    state: FullscreenState,
 }
 
+#[derive(Debug, Default)]
+enum FullscreenState {
+    #[default]
+    Normal,
+    Fullscreen {
+        child_window: Retained<NSWindow>,
+        fullscreen_content_view: Retained<NSView>,
+        original_frame: NSRect,
+    },
+}
+
+/// SAFETY: Each method must ensure that they are only accessing values on the main thread.
 unsafe impl Send for Fullscreen {}
+/// SAFETY: Each method must ensure that they are only accessing values on the main thread.
 unsafe impl Sync for Fullscreen {}
 
 impl Fullscreen {
-    pub fn new(ns_window_ptr: *mut NSWindow, ns_view_ptr: *mut NSView) -> Self {
-        Self {
-            ns_window_ptr,
-            ns_view_ptr,
-            standard_frame: None,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    pub fn enter(&mut self, is_fullscreen: bool, set_frame: bool) {
-        unsafe {
-            let mtm = MainThreadMarker::new().unwrap();
-            let ns_app = NSApp(mtm);
-            let ns_screen = NSScreen::mainScreen(mtm).unwrap();
-            let ns_view = Retained::retain(self.ns_view_ptr).unwrap();
-            let ns_window = Retained::retain(self.ns_window_ptr).unwrap();
-
-            let ns_window_frame = ns_window.frame();
-            let frame = ns_window.contentRectForFrameRect(ns_window_frame);
-            self.standard_frame = Some(frame);
-
-            ns_app.setPresentationOptions(
-                NSApplicationPresentationOptions::HideDock
-                    | NSApplicationPresentationOptions::HideMenuBar
-                    | NSApplicationPresentationOptions::DisableForceQuit
-                    | NSApplicationPresentationOptions::DisableProcessSwitching
-                    | NSApplicationPresentationOptions::DisableSessionTermination
-                    | NSApplicationPresentationOptions::DisableAppleMenu
-                    | NSApplicationPresentationOptions::DisableHideApplication
-                    | NSApplicationPresentationOptions::DisableCursorLocationAssistance
-                    | NSApplicationPresentationOptions::DisableMenuBarTransparency,
-            );
-            let screen_frame = ns_screen.frame();
-            if set_frame {
-                ns_window.setFrame_display(screen_frame, true);
-            }
-            if is_fullscreen {
-                ns_view.enterFullScreenMode_withOptions(&ns_screen, None);
-            }
-        }
-    }
-
-    pub fn exit(&self, is_fullscreen: bool, set_frame: bool) {
-        unsafe {
-            let mtm = MainThreadMarker::new().unwrap();
-            let ns_app = NSApp(mtm);
-            let ns_view = Retained::retain(self.ns_view_ptr).unwrap();
-            let ns_window = Retained::retain(self.ns_window_ptr).unwrap();
-
-            ns_app.setPresentationOptions(NSApplicationPresentationOptions::Default);
-
-            let frame = self.standard_frame.unwrap();
-            if set_frame {
-                ns_window.setFrame_display(frame, true);
-            }
-            if is_fullscreen {
-                ns_view.exitFullScreenModeWithOptions(None);
-            }
-        }
-    }
-
-    pub fn is_fullscreen(&self) -> bool {
-        unsafe {
-            let ns_view = Retained::retain(self.ns_view_ptr).unwrap();
-            ns_view.isInFullScreenMode()
-        }
-    }
-}
-
-struct AppState {
-    fullscreen: Mutex<Fullscreen>,
-}
-
-#[tauri::command]
-fn start(state: State<AppState>, is_fullscreen: bool, set_frame: bool) {
-    let mut fullscreen = state.fullscreen.lock().unwrap();
-    fullscreen.enter(is_fullscreen, set_frame);
-}
-
-#[tauri::command]
-fn stop(state: State<AppState>, is_fullscreen: bool, set_frame: bool) {
-    let fullscreen = state.fullscreen.lock().unwrap();
-    fullscreen.exit(is_fullscreen, set_frame);
-}
-
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![start, stop])
-        .setup(|app| {
-            let window = app.get_webview_window("main").unwrap();
-            let ns_window_ptr = window.ns_window().unwrap() as *mut NSWindow;
-            let ns_view_ptr = window.ns_view().unwrap() as *mut NSView;
-            let fullscreen = Fullscreen::new(ns_window_ptr, ns_view_ptr);
-            app.manage(AppState {
-                fullscreen: Mutex::new(fullscreen),
-            });
-            Ok(())
-        })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
-}
-
-// NOTE: static inside thread_local! implementation.
-/*
-use objc2::{rc::Retained, MainThreadMarker};
-use objc2_app_kit::{
-    NSApp, NSApplicationPresentationOptions, NSScreen, NSView, NSWindow, NSWindowSharingType,
-};
-use once_cell::sync::OnceCell;
-use tauri::Manager;
-
-thread_local! {
-    static NS_VIEW: OnceCell<Retained<NSView>> = OnceCell::new();
-    static NS_WINDOW: OnceCell<Retained<NSWindow>> = OnceCell::new();
-}
-
-pub fn enter_fullscreen(ns_window: &Retained<NSWindow>, ns_view: &Retained<NSView>) {
-    let mtm = MainThreadMarker::new();
-    assert!(MainThreadMarker::new().is_some());
-    if let Some(mtm) = mtm {
+    pub fn enter(&mut self, app_handle: &AppHandle) {
+        // Ensure we're running on the main thread.
+        let mtm = MainThreadMarker::new().unwrap();
         let ns_app = NSApp(mtm);
+
+        let window = app_handle.get_webview_window("main").unwrap();
+        let ns_window = unsafe { window.ns_window().unwrap().cast::<NSWindow>().as_ref() }
+            .unwrap()
+            .retain();
+        let ns_view = unsafe { window.ns_view().unwrap().cast::<NSView>().as_ref() }
+            .unwrap()
+            .retain();
+
+        let ns_screen = NSScreen::mainScreen(mtm).unwrap();
+
+        // Get the size of the window before resizing.
+        let original_frame = ns_window.contentRectForFrameRect(ns_window.frame());
+
         ns_app.setPresentationOptions(
             NSApplicationPresentationOptions::HideDock
                 | NSApplicationPresentationOptions::HideMenuBar
@@ -146,53 +62,94 @@ pub fn enter_fullscreen(ns_window: &Retained<NSWindow>, ns_view: &Retained<NSVie
                 | NSApplicationPresentationOptions::DisableCursorLocationAssistance
                 | NSApplicationPresentationOptions::DisableMenuBarTransparency,
         );
-        let ns_screen = NSScreen::mainScreen(mtm);
-        if let Some(ns_screen) = ns_screen {
-            unsafe {
-                ns_view.enterFullScreenMode_withOptions(&ns_screen, None);
-            }
-        }
-        ns_window.setSharingType(NSWindowSharingType::None);
-    }
-}
 
-pub fn exit_fullscreen(ns_window: &Retained<NSWindow>, ns_view: &Retained<NSView>) {
-    let mtm = MainThreadMarker::new();
-    assert!(MainThreadMarker::new().is_some());
-    if let Some(mtm) = mtm {
-        let ns_app = NSApp(mtm);
-        ns_app.setPresentationOptions(NSApplicationPresentationOptions::Default);
+        // Maximize webview window.
+        let screen_frame = ns_screen.frame();
+        ns_view
+            .window()
+            .unwrap()
+            .setFrame_display(screen_frame, true);
+
+        // Enter fullscreen.
+        unsafe { ns_view.enterFullScreenMode_withOptions(&ns_screen, None) };
+        // Get the new window, the fullscreen window.
+        let fullscreen_window = ns_view.window().unwrap();
+
+        // Add the webview window as a child of the fullscreen window.
         unsafe {
-            ns_view.exitFullScreenModeWithOptions(None);
+            fullscreen_window.addChildWindow_ordered(&ns_window, NSWindowOrderingMode::Below)
+        };
+
+        // Ensure the fullscreen window can handle *some* events.
+        let delegate = unsafe { ns_window.delegate() }.unwrap();
+        fullscreen_window.setDelegate(Some(&delegate));
+
+        // Display fullscreen window and give it focus.
+        fullscreen_window.makeKeyAndOrderFront(None);
+
+        self.state = FullscreenState::Fullscreen {
+            child_window: ns_window,
+            fullscreen_content_view: ns_view,
+            original_frame,
+        };
+    }
+
+    pub fn exit(&mut self) {
+        // Ensure we're running on the main thread.
+        let mtm = MainThreadMarker::new().unwrap();
+        let ns_app = NSApp(mtm);
+
+        let FullscreenState::Fullscreen {
+            child_window,
+            fullscreen_content_view,
+            original_frame,
+        } = std::mem::take(&mut self.state)
+        else {
+            eprintln!("Not in fullscreen mode");
+            return;
+        };
+
+        unsafe {
+            fullscreen_content_view.exitFullScreenModeWithOptions(None);
+            child_window.setParentWindow(None);
         }
-        ns_window.setSharingType(NSWindowSharingType::ReadOnly);
+
+        // Display original window again and make it focused.
+        child_window.makeKeyAndOrderFront(None);
+        // Restore window size.
+        child_window.setFrame_display(original_frame, true);
+
+        ns_app.setPresentationOptions(NSApplicationPresentationOptions::Default);
+    }
+
+    pub fn is_fullscreen(&self) -> bool {
+        match &self.state {
+            FullscreenState::Fullscreen {
+                fullscreen_content_view,
+                ..
+            } => {
+                // SAFETY: I think this function should be ok to call from any thread.
+                unsafe { fullscreen_content_view.isInFullScreenMode() }
+            },
+            _ => false,
+        }
     }
 }
 
-#[tauri::command]
-fn start() {
-    NS_WINDOW.with(|ns_window| {
-        NS_VIEW.with(|ns_view| {
-            if let (Some(ns_window), Some(ns_view)) = (ns_window.get(), ns_view.get()) {
-                if unsafe { !ns_view.isInFullScreenMode() } {
-                    enter_fullscreen(&ns_window, &ns_view);
-                }
-            }
-        });
-    });
+struct AppState {
+    fullscreen: Mutex<Fullscreen>,
 }
 
 #[tauri::command]
-fn stop() {
-    NS_WINDOW.with(|ns_window| {
-        NS_VIEW.with(|ns_view| {
-            if let (Some(ns_window), Some(ns_view)) = (ns_window.get(), ns_view.get()) {
-                if unsafe { ns_view.isInFullScreenMode() } {
-                    exit_fullscreen(&ns_window, &ns_view);
-                }
-            }
-        });
-    });
+fn start(app_handle: AppHandle, state: State<AppState>) {
+    let mut fullscreen = state.fullscreen.lock().unwrap();
+    fullscreen.enter(&app_handle);
+}
+
+#[tauri::command]
+fn stop(state: State<AppState>) {
+    let mut fullscreen = state.fullscreen.lock().unwrap();
+    fullscreen.exit();
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -200,27 +157,15 @@ pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![start, stop])
         .setup(|app| {
-            let webview_window = app.get_webview_window("main");
-            if let Some(window) = webview_window {
-                let ns_window_raw_ptr = window.ns_window().unwrap();
-                let ns_window = unsafe { Retained::retain(ns_window_raw_ptr as *mut NSWindow) };
-                let ns_view_raw_ptr = window.ns_view().unwrap();
-                let ns_view = unsafe { Retained::retain(ns_view_raw_ptr as *mut NSView) };
-                if let (Some(ns_window), Some(ns_view)) = (ns_window, ns_view) {
-                    NS_WINDOW.with(|cell| {
-                        let _ = cell.set(ns_window.clone());
-                    });
-                    NS_VIEW.with(|cell| {
-                        let _ = cell.set(ns_view.clone());
-                    });
-                }
-            }
+            let fullscreen = Fullscreen::new();
+            app.manage(AppState {
+                fullscreen: Mutex::new(fullscreen),
+            });
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-*/
 
 // NOTE: Objective-c implementation.
 /*
